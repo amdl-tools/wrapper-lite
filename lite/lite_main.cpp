@@ -342,15 +342,24 @@ static void handle_webplayback(const httplib::Request& req, httplib::Response& r
         return;
     }
 
-    std::string m3u8 = AppleApi::getWebPlayback(adamId, tokens.dev_token, tokens.music_token);
-    if (m3u8.empty()) {
+    /* Return the full Apple webPlayback JSON so gamdl can extract tags/metadata.
+       The raw response contains songList[0].assets[0].metadata with all tag fields. */
+    std::string raw = AppleApi::getWebPlaybackRaw(adamId, tokens.dev_token, tokens.music_token);
+    if (raw.empty()) {
         res.set_content(json_error(404, "webplayback not available"), "application/json");
         return;
     }
 
+    cJSON* apple_json = cJSON_Parse(raw.c_str());
+    if (!apple_json) {
+        res.set_content(json_error(500, "webplayback json parse error"), "application/json");
+        return;
+    }
+
+    /* Wrap the full Apple response in our standard envelope */
     cJSON* data = cJSON_CreateObject();
     cJSON_AddStringToObject(data, "adamId", adamId.c_str());
-    cJSON_AddStringToObject(data, "m3u8", m3u8.c_str());
+    cJSON_AddItemToObject(data, "webplayback", apple_json);
     res.set_content(json_success(data), "application/json");
 }
 

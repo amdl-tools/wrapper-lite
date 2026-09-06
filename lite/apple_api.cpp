@@ -375,6 +375,46 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     return m3u8;
 }
 
+/* Returns the full Apple webPlayback JSON string (for gamdl tags/metadata). */
+std::string AppleApi::getWebPlaybackRaw(const std::string& adamId,
+                                         const std::string& devToken,
+                                         const std::string& musicToken) {
+    CurlEasy curl;
+    if (!curl.ok) return "";
+
+    cJSON* req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
+    char* printed = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    std::string postBody = printed ? printed : "";
+    if (printed) cJSON_free(printed);
+
+    std::string resp;
+    curl.setOptStr(CURLOPT_URL, "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback");
+    curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
+    curl.setOptPtr(CURLOPT_WRITEDATA, &resp);
+    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
+    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
+    curl.setOptStr(CURLOPT_POSTFIELDS, postBody.c_str());
+    curl.setOptInt(CURLOPT_POST, 1);
+
+    CurlSlist headers;
+    headers.append(strfmt("Authorization: Bearer %s", devToken.c_str()).c_str());
+    headers.append(strfmt("X-Apple-Music-User-Token: %s", musicToken.c_str()).c_str());
+    headers.append("Content-Type: application/json");
+    headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+    curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
+
+    if (!curl.perform()) { LOG_WARN("webplayback-raw curl perform failed"); return ""; }
+    long wstatus = curl.getResponseCode();
+    if (wstatus != 200 && wstatus != 0) {
+        LOG_WARN("webplayback-raw http status=%ld body=%.300s", wstatus, resp.c_str());
+        return "";
+    }
+    return resp;
+}
+
 /* ---- License ---- */
 bool AppleApi::getLicense(const std::string& adamId,
                            const std::string& challenge,
