@@ -12,8 +12,12 @@ It provides five endpoints on one HTTP port: M3U8, Key, Lyrics, License, and Web
 ## Build
 
 ```bash
+wget https://dl.google.com/android/repository/android-ndk-r23b-linux.zip
+unzip android-ndk-r23b-linux.zip
 mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j$(nproc)
 ```
 
