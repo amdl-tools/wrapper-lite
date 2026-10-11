@@ -446,15 +446,30 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     return m3u8;
 }
 
-/* Returns the full Apple webPlayback JSON string (for gamdl tags/metadata). */
+/* ---- WebPlayback (full JSON) ---- */
+/*
+ * Like getWebPlayback() but returns the raw Apple webPlayback API response body
+ * verbatim (i.e. the full JSON: songList, assets, metadata, hls-playlist-url …)
+ * instead of extracting only the m3u8 URL.
+ *
+ * isLibrary=true uses the universalLibraryId key instead of salableAdamId, which
+ * is required for tracks from the user's personal library.
+ *
+ * Error conditions (network failure, Apple rejection, bad JSON) return "".
+ */
 std::string AppleApi::getWebPlaybackRaw(const std::string& adamId,
+                                         bool isLibrary,
                                          const std::string& devToken,
                                          const std::string& musicToken) {
     CurlEasy curl;
     if (!curl.ok) return "";
 
     cJSON* req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
+    if (isLibrary) {
+        cJSON_AddStringToObject(req, "universalLibraryId", adamId.c_str());
+    } else {
+        cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
+    }
     char* printed = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
     std::string postBody = printed ? printed : "";
@@ -477,12 +492,44 @@ std::string AppleApi::getWebPlaybackRaw(const std::string& adamId,
     headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("webplayback-raw curl perform failed"); return ""; }
+    if (!curl.perform()) { LOG_WARN("webplayback-full curl perform failed"); return ""; }
     long wstatus = curl.getResponseCode();
     if (wstatus != 200 && wstatus != 0) {
-        LOG_WARN("webplayback-raw http status=%ld body=%.300s", wstatus, resp.c_str());
+        LOG_WARN("webplayback-full http status=%ld body=%.300s", wstatus, resp.c_str());
         return "";
     }
+
+    /* Validate: must parse as JSON and must not carry a top-level failureType or
+       errors array.  We return the raw string on success so the caller can embed
+       it directly into the /webplayback-full response without re-serialising. */
+    cJSON* root = cJSON_Parse(resp.c_str());
+    if (!root) { LOG_WARN("webplayback-full bad json: %.200s", resp.c_str()); return ""; }
+
+    cJSON* failureType = cJSON_GetObjectItemCaseSensitive(root, "failureType");
+    if (cJSON_IsString(failureType)) {
+        LOG_WARN("webplayback-full rejected failureType=%s body=%.300s",
+                 failureType->valuestring, resp.c_str());
+        cJSON_Delete(root);
+        return "";
+    }
+
+    cJSON* errors = cJSON_GetObjectItemCaseSensitive(root, "errors");
+    if (errors && cJSON_GetArraySize(errors) > 0) {
+        LOG_WARN("webplayback-full API errors: %.300s", resp.c_str());
+        cJSON_Delete(root);
+        return "";
+    }
+
+    cJSON* songList = cJSON_GetObjectItemCaseSensitive(root, "songList");
+    if (!cJSON_IsArray(songList) || cJSON_GetArraySize(songList) == 0) {
+        LOG_WARN("webplayback-full empty/missing songList: %.200s", resp.c_str());
+        cJSON_Delete(root);
+        return "";
+    }
+
+    cJSON_Delete(root);
+    LOG_DEBUG("webplayback-full success adamId=%s isLibrary=%d size=%zu",
+              adamId.c_str(), (int)isLibrary, resp.size());
     return resp;
 }
 

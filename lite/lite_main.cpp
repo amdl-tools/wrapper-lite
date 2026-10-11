@@ -355,24 +355,69 @@ static void handle_webplayback(const httplib::Request& req, httplib::Response& r
         return;
     }
 
-    /* Return the full Apple webPlayback JSON so gamdl can extract tags/metadata.
-       The raw response contains songList[0].assets[0].metadata with all tag fields. */
-    std::string raw = AppleApi::getWebPlaybackRaw(adamId, tokens.dev_token, tokens.music_token);
-    if (raw.empty()) {
+    std::string m3u8 = AppleApi::getWebPlayback(adamId, tokens.dev_token, tokens.music_token);
+    if (m3u8.empty()) {
         res.set_content(json_error(404, "webplayback not available"), "application/json");
         return;
     }
 
-    cJSON* apple_json = cJSON_Parse(raw.c_str());
-    if (!apple_json) {
-        res.set_content(json_error(500, "webplayback json parse error"), "application/json");
+    cJSON* data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "adamId", adamId.c_str());
+    cJSON_AddStringToObject(data, "m3u8", m3u8.c_str());
+    res.set_content(json_success(data), "application/json");
+}
+
+/*
+ * GET /webplayback-full?adamId=<id>[&library=1]
+ *
+ * Returns the full Apple webPlayback JSON (songList, assets, metadata, …) so
+ * Python callers can build metadata tags without a separate cookies.txt /
+ * media-user-token.  The response embeds the raw Apple JSON inside the standard
+ * wrapper-lite envelope:
+ *
+ *   { "code": 0, "msg": "SUCCESS",
+ *     "data": { "adamId": "…", "isLibrary": false,
+ *               "webplayback": { "songList": [ { "assets": [ { "metadata": {…} } ] } ] } } }
+ *
+ * On error the standard { "code": <non-zero>, "msg": "…" } envelope is returned.
+ */
+static void handle_webplayback_full(const httplib::Request& req, httplib::Response& res) {
+    auto adamId   = req.get_param_value("adamId");
+    auto libParam = req.get_param_value("library");
+
+    if (adamId.empty()) {
+        res.set_content(json_error(400, "missing adamId"), "application/json");
         return;
     }
 
-    /* Wrap the full Apple response in our standard envelope */
+    bool isLibrary = (!libParam.empty() && libParam != "0" && libParam != "false");
+
+    WebTokens tokens = get_web_tokens();
+    if (!tokens.valid()) {
+        res.set_content(json_error(500, "missing music/dev token, run --login first"), "application/json");
+        return;
+    }
+
+    std::string rawJson = AppleApi::getWebPlaybackRaw(adamId, isLibrary,
+                                                       tokens.dev_token, tokens.music_token);
+    if (rawJson.empty()) {
+        res.set_content(json_error(404, "webplayback not available"), "application/json");
+        return;
+    }
+
+    /* Embed the raw Apple JSON as the "webplayback" field value.
+       We build the outer envelope manually to avoid a double parse+serialise
+       round-trip that could alter Unicode escapes or number precision. */
+    cJSON* webpbJson = cJSON_Parse(rawJson.c_str());
+    if (!webpbJson) {
+        res.set_content(json_error(500, "internal json parse error"), "application/json");
+        return;
+    }
+
     cJSON* data = cJSON_CreateObject();
     cJSON_AddStringToObject(data, "adamId", adamId.c_str());
-    cJSON_AddItemToObject(data, "webplayback", apple_json);
+    cJSON_AddBoolToObject(data, "isLibrary", isLibrary ? 1 : 0);
+    cJSON_AddItemToObject(data, "webplayback", webpbJson);
     res.set_content(json_success(data), "application/json");
 }
 
@@ -648,6 +693,7 @@ int main(int argc, char* argv[]) {
     svr.Get("/key", handle_key);
     svr.Get("/lyrics", handle_lyrics);
     svr.Get("/webplayback", handle_webplayback);
+    svr.Get("/webplayback-full", handle_webplayback_full);
     svr.Post("/license", handle_license);
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {

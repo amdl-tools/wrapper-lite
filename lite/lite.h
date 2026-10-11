@@ -81,7 +81,12 @@ struct AppleApi {
     static std::string getWebPlayback(const std::string& adamId,
                                        const std::string& devToken,
                                        const std::string& musicToken);
+    /* Like getWebPlayback but returns the full Apple API JSON response body
+       (songList, assets, metadata, hls-playlist-url, …) instead of extracting
+       just the m3u8 URL.  Used by the /webplayback-full endpoint so callers
+       can build metadata tags without a separate cookies / media-user-token. */
     static std::string getWebPlaybackRaw(const std::string& adamId,
+                                          bool isLibrary,
                                           const std::string& devToken,
                                           const std::string& musicToken);
     static bool getLicense(const std::string& adamId,
