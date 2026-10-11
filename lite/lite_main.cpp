@@ -257,7 +257,18 @@ static void handle_key(const httplib::Request& req, httplib::Response& res) {
         res.set_content(json_error(400, "missing adamId"), "application/json");
         return;
     }
-    if (uri.empty()) uri = "skd://itunes.apple.com/P000000000/s1/e1";
+    if (uri.empty()) {
+        res.set_content(json_error(400, "missing uri"), "application/json");
+        return;
+    }
+    /* The prefetch key URI (adamId=0) derives a shared context template, not a
+       playable song key.  Requesting it with a real adamId yields a key that
+       cannot decrypt the track, so reject that combination. */
+    static const char* kPrefetchUri = "skd://itunes.apple.com/P000000000/s1/e1";
+    if (adamId != "0" && uri == kPrefetchUri) {
+        res.set_content(json_error(400, "invalid uri for adamId"), "application/json");
+        return;
+    }
 
     uint8_t cap_ctx[0x8000], cap_state[0x2100];
     uint64_t rcx = 0, rax = 0, rdx = 0, r9 = 0, rbp = 0;
@@ -294,6 +305,7 @@ static void handle_lyrics(const httplib::Request& req, httplib::Response& res) {
     auto adamId = req.get_param_value("adamId");
     auto language = req.get_param_value("language");
     auto syllable = req.get_param_value("syllable");
+    auto script = req.get_param_value("script");
     if (adamId.empty()) {
         res.set_content(json_error(400, "missing adamId"), "application/json");
         return;
@@ -316,7 +328,8 @@ static void handle_lyrics(const httplib::Request& req, httplib::Response& res) {
     }
 
     std::string lyrics = AppleApi::getLyrics(adamId, tokens.storefront_id, language,
-                                              use_syllable, tokens.dev_token, tokens.music_token);
+                                              use_syllable, script,
+                                              tokens.dev_token, tokens.music_token);
     if (lyrics.empty()) {
         res.set_content(json_error(404, "lyrics not found"), "application/json");
         return;
@@ -373,13 +386,21 @@ static void handle_license(const httplib::Request& req, httplib::Response& res) 
     const char* adamId_s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(req_json, "adamId"));
     const char* challenge_s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(req_json, "challenge"));
     const char* uri_s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(req_json, "uri"));
+    const char* drmType_s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(req_json, "drm-type"));
     std::string adamId = adamId_s ? adamId_s : "";
     std::string challenge = challenge_s ? challenge_s : "";
     std::string uri = uri_s ? uri_s : "";
+    std::string drmType = drmType_s ? drmType_s : "";
     cJSON_Delete(req_json);
 
     if (adamId.empty() || challenge.empty() || uri.empty()) {
         res.set_content(json_error(400, "missing adamId, challenge, or uri"), "application/json");
+        return;
+    }
+
+    if (drmType.empty()) drmType = "wv";
+    if (drmType != "wv" && drmType != "pr") {
+        res.set_content(json_error(400, "drm-type must be wv or pr"), "application/json");
         return;
     }
 
@@ -391,7 +412,7 @@ static void handle_license(const httplib::Request& req, httplib::Response& res) 
 
     std::string license;
     int renew = 0;
-    if (!AppleApi::getLicense(adamId, challenge, uri, tokens.dev_token, tokens.music_token, license, renew)) {
+    if (!AppleApi::getLicense(adamId, challenge, uri, tokens.dev_token, tokens.music_token, drmType, license, renew)) {
         res.set_content(json_error(500, "license acquisition failed"), "application/json");
         return;
     }

@@ -68,8 +68,20 @@ c++ -std=c++11 -O2 -o wrapper-lite-qemu wrapper-lite-qemu.cpp
 The launcher locates the QEMU binary in this order:
 
 1. `--qemu-bin <path>` / `QEMU_BIN`
-2. `PATH`
-3. `qemu/bin/` (bundled)
+2. `qemu/bin/` (bundled)
+3. `PATH`
+
+The bundled QEMU is preferred so that the firmware (`-L qemu/bin`), the QEMU
+modules (`QEMU_MODULE_DIR`) and the support libraries (`qemu/lib`) always come
+from the same package. `-L`, `LD_LIBRARY_PATH` and `QEMU_MODULE_DIR` are only
+adjusted for the bundled QEMU; a system QEMU keeps its own libraries, modules
+and firmware.
+
+A package never ships glibc (`libc.so.6`, `libm.so.6`): the ELF interpreter is
+always the host's and cannot be replaced through `LD_LIBRARY_PATH`, so the
+loader and libc must stay a matched pair from the host. Only non-glibc support
+libraries are bundled, in `qemu/lib/` (`qemu/bin/` on Android, where the Termux
+packages place them next to the binary).
 
 See [QEMU launcher arguments](#qemu-launcher-arguments) for the full option
 list.
@@ -95,10 +107,10 @@ All responses use:
 | Endpoint | Method | Parameters |
 |----------|--------|------------|
 | `/m3u8` | GET | `adamId` |
-| `/key` | GET | `adamId`, optional `uri` |
-| `/lyrics` | GET | `adamId`, optional `language`, optional `syllable` (`1`=syllable-lyrics default, `0`=lyrics) |
+| `/key` | GET | `adamId`, `uri` (required; the prefetch `skd://itunes.apple.com/P000000000/s1/e1` is rejected unless `adamId=0`) |
+| `/lyrics` | GET | `adamId`, optional `language`, optional `syllable` (`1`=word-timed syllable-lyrics with translations/romanization, `0`=line-timed lyrics converted in-wrapper **and still carrying translations/romanization as whole-line text**), optional `script` (transliteration script, default `en-Latn`) |
 | `/webplayback` | GET | `adamId` |
-| `/license` | POST | JSON: `adamId`, `challenge`, `uri` |
+| `/license` | POST | JSON: `adamId`, `challenge`, `uri`, optional `drm-type` (`wv`=Widevine (default), `pr`=PlayReady) |
 | `/status` | GET | returns `regions` (list of storefront codes this wrapper can serve) |
 
 ## lite arguments

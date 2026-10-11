@@ -221,23 +221,86 @@ std::string AppleApi::getDevToken() {
 }
 
 /* ---- Lyrics ---- */
-/* syllable=true  -> word-timed /syllable-lyrics (attributes.ttmlLocalizations)
- * syllable=false -> standard /lyrics            (attributes.ttml / text) */
+/* Convert word-timed syllable TTML into line-timed form:
+ *   1) itunes:timing="Word" -> "Line"
+ *   2) strip per-word <span> wrappers everywhere (main <p> lines as well as
+ *      the <text> entries inside <translations> and <transliterations>), so
+ *      translations/transliterations stay available in the line-timed output
+ *      as whole-sentence text keyed by the same itunes:key (L1..) as the
+ *      main lyrics.
+ *   3) collapse runs of 2+ spaces to a single space inside <p> and <text>
+ *      content (Apple's romanization spans keep double spaces between words;
+ *      the main lyrics text is unchanged). */
+static std::string collapseSpaces(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prevSpace = false;
+    for (char c : s) {
+        if (c == ' ') {
+            if (!prevSpace) out += c;
+            prevSpace = true;
+        } else {
+            out += c;
+            prevSpace = false;
+        }
+    }
+    return out;
+}
+
+static std::string syllableTtmlToPlain(std::string tt) {
+    size_t p;
+    if ((p = tt.find("itunes:timing=\"Word\"")) != std::string::npos) {
+        tt.replace(p, strlen("itunes:timing=\"Word\""), "itunes:timing=\"Line\"");
+    }
+    /* strip <span ...> and </span> */
+    std::string out;
+    out.reserve(tt.size());
+    for (size_t i = 0; i < tt.size();) {
+        if (tt.compare(i, 6, "<span ") == 0) {
+            size_t close = tt.find('>', i);
+            i = (close == std::string::npos) ? tt.size() : close + 1;
+        } else if (tt.compare(i, 7, "</span>") == 0) {
+            i += 7;
+        } else {
+            out += tt[i++];
+        }
+    }
+    tt.swap(out);
+    /* normalize spaces inside tag content (<p>, <text>, <span> remnants gone) */
+    size_t pos = 0;
+    while (pos < tt.size()) {
+        size_t open = tt.find('<', pos);
+        if (open == std::string::npos) { tt.replace(pos, std::string::npos, collapseSpaces(tt.substr(pos))); break; }
+        size_t close = tt.find('>', open);
+        if (close == std::string::npos) break;
+        /* text between previous '>' and this '<' */
+        if (open > pos) tt.replace(pos, open - pos, collapseSpaces(tt.substr(pos, open - pos)));
+        pos = close + 1;
+    }
+    return tt;
+}
+
+/* syllable=true  -> word-timed TTML from /syllable-lyrics
+ * syllable=false -> line-timed TTML converted in-wrapper from the syllable
+ *                   response (Apple's /lyrics endpoint output) */
 std::string AppleApi::getLyrics(const std::string& adamId,
                                   const std::string& region,
                                   const std::string& language,
                                   bool syllable,
+                                  const std::string& script,
                                   const std::string& devToken,
                                   const std::string& musicToken) {
     CurlEasy curl;
     if (!curl.ok) return "";
 
+    /* Always request the word-timed /syllable-lyrics endpoint; for the
+       line-timed form we convert locally (identical to /lyrics). */
     std::string url = strfmt(
-        "https://amp-api.music.apple.com/v1/catalog/%s/songs/%s/%s"
-        "?l[lyrics]=%s&extend=ttmlLocalizations&l[script]=en-Latn",
+        "https://amp-api.music.apple.com/v1/catalog/%s/songs/%s/syllable-lyrics"
+        "?l[lyrics]=%s&extend=ttmlLocalizations&l[script]=%s",
         region.c_str(), adamId.c_str(),
-        syllable ? "syllable-lyrics" : "lyrics",
-        language.c_str());
+        language.c_str(),
+        script.empty() ? "en-Latn" : script.c_str());
 
     std::string resp;
     curl.setOptStr(CURLOPT_URL, url.c_str());
@@ -274,9 +337,17 @@ std::string AppleApi::getLyrics(const std::string& adamId,
     if (cJSON_IsArray(data) && cJSON_GetArraySize(data) > 0) {
         cJSON* first = cJSON_GetArrayItem(data, 0);
         cJSON* attrs = cJSON_GetObjectItemCaseSensitive(first, "attributes");
-        cJSON* ttml = cJSON_GetObjectItemCaseSensitive(attrs,
-                         syllable ? "ttmlLocalizations" : "ttml");
-        if (cJSON_IsString(ttml)) lyrics = ttml->valuestring;
+        cJSON* ttml = cJSON_GetObjectItemCaseSensitive(attrs, "ttmlLocalizations");
+        if (cJSON_IsString(ttml) && cJSON_GetStringValue(ttml)) {
+            std::string raw = ttml->valuestring;
+            if (syllable) {
+                lyrics = raw;
+            } else {
+                /* convert word-timed syllable TTML to the line-timed form
+                   that Apple's /lyrics endpoint returns */
+                lyrics = syllableTtmlToPlain(raw);
+            }
+        }
         if (lyrics.empty() && !syllable) {
             /* some tracks only expose plain-text lyrics */
             cJSON* text = cJSON_GetObjectItemCaseSensitive(attrs, "text");
@@ -421,6 +492,7 @@ bool AppleApi::getLicense(const std::string& adamId,
                            const std::string& uri,
                            const std::string& devToken,
                            const std::string& musicToken,
+                           const std::string& drmType,
                            std::string& outLicense,
                            int& outRenew) {
     CurlEasy curl;
@@ -429,7 +501,9 @@ bool AppleApi::getLicense(const std::string& adamId,
     cJSON* req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "challenge", challenge.c_str());
     cJSON_AddStringToObject(req, "uri", uri.c_str());
-    cJSON_AddStringToObject(req, "key-system", "com.widevine.alpha");
+    /* Only two DRM systems are supported: wv (default) and pr. */
+    const char* keySystem = (drmType == "pr") ? "com.microsoft.playready" : "com.widevine.alpha";
+    cJSON_AddStringToObject(req, "key-system", keySystem);
     cJSON_AddStringToObject(req, "adamId", adamId.c_str());
     cJSON_AddBoolToObject(req, "isLibrary", 0);
     cJSON_AddBoolToObject(req, "user-initiated", 1);
