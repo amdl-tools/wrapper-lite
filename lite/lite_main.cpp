@@ -696,6 +696,37 @@ int main(int argc, char* argv[]) {
     svr.Get("/webplayback-full", handle_webplayback_full);
     svr.Post("/license", handle_license);
 
+    /*
+     * GET /auth
+     *
+     * Returns the current dev_token and music_token (music-user-token) held by
+     * wrapper-lite.  Python callers use these to build an AppleMusicApi client
+     * that can call the Apple AMP Catalog API (get_song?include=lyrics, etc.)
+     * without a separate cookies.txt / media-user-token from the user.
+     *
+     * The tokens are the same ones wrapper-lite already uses internally for
+     * every other Apple API call, so exposing them adds no new attack surface.
+     * The endpoint is intentionally read-only and returns no passwords.
+     *
+     * Response shape:
+     *   { "code": 0, "msg": "SUCCESS",
+     *     "data": { "dev_token": "eyJ…", "music_token": "Au…" } }
+     */
+    svr.Get("/auth", [](const httplib::Request&, httplib::Response& res) {
+        WebTokens tokens = get_web_tokens();
+        if (!tokens.valid()) {
+            res.set_content(
+                json_error(503, "tokens not ready (login required)"),
+                "application/json"
+            );
+            return;
+        }
+        cJSON* data = cJSON_CreateObject();
+        cJSON_AddStringToObject(data, "dev_token",   tokens.dev_token.c_str());
+        cJSON_AddStringToObject(data, "music_token", tokens.music_token.c_str());
+        res.set_content(json_success(data), "application/json");
+    });
+
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         std::string storefront;
         {
