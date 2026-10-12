@@ -78,17 +78,29 @@ struct AppleApi {
                                   const std::string& script,
                                   const std::string& devToken,
                                   const std::string& musicToken);
+    /* HLS master URL of a track ("" when unavailable). */
     static std::string getWebPlayback(const std::string& adamId,
                                        const std::string& devToken,
                                        const std::string& musicToken);
-    /* Like getWebPlayback but returns the full Apple API JSON response body
-       (songList, assets, metadata, hls-playlist-url, …) instead of extracting
-       just the m3u8 URL.  Used by the /webplayback-full endpoint so callers
-       can build metadata tags without a separate cookies / media-user-token. */
-    static std::string getWebPlaybackRaw(const std::string& adamId,
-                                          bool isLibrary,
-                                          const std::string& devToken,
-                                          const std::string& musicToken);
+    /* The webPlayback request body, built like gamdl does: salableAdamId (or
+       universalLibraryId for tracks of the user's library) plus an optional
+       language. With an empty language and library=false it is byte-identical
+       to what getWebPlayback always sent. */
+    static std::string webPlaybackRequestBody(const std::string& adamId,
+                                               const std::string& language,
+                                               bool library);
+    /* Raw webPlayback JSON as returned by Apple ("" on any failure; the reason
+       is logged). Its songList[0].assets[0].metadata is what song tags are
+       built from. */
+    static std::string fetchWebPlayback(const std::string& adamId,
+                                         const std::string& language,
+                                         bool library,
+                                         const std::string& devToken,
+                                         const std::string& musicToken);
+    /* "" when a webPlayback body is usable, otherwise a short reason. */
+    static std::string webPlaybackProblem(const std::string& rawJson);
+    /* HLS master URL taken from a raw webPlayback body ("" if none). */
+    static std::string webPlaybackM3u8(const std::string& rawJson);
     static bool getLicense(const std::string& adamId,
                             const std::string& challenge,
                             const std::string& uri,

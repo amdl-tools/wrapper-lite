@@ -359,64 +359,46 @@ std::string AppleApi::getLyrics(const std::string& adamId,
 }
 
 /* ---- WebPlayback ---- */
-std::string AppleApi::getWebPlayback(const std::string& adamId,
-                                      const std::string& devToken,
-                                      const std::string& musicToken) {
-    CurlEasy curl;
-    if (!curl.ok) return "";
-
+std::string AppleApi::webPlaybackRequestBody(const std::string& adamId,
+                                              const std::string& language,
+                                              bool library) {
     cJSON* req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
+    cJSON_AddStringToObject(req, library ? "universalLibraryId" : "salableAdamId", adamId.c_str());
+    if (!language.empty()) cJSON_AddStringToObject(req, "language", language.c_str());
     char* printed = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
-    std::string postBody = printed ? printed : "";
+    std::string body = printed ? printed : "";
     if (printed) cJSON_free(printed);
-    std::string resp;
-    curl.setOptStr(CURLOPT_URL, "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback");
-    curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
-    curl.setOptPtr(CURLOPT_WRITEDATA, &resp);
-    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
-    curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
-    curl.setOptStr(CURLOPT_POSTFIELDS, postBody.c_str());
-    curl.setOptInt(CURLOPT_POST, 1);
+    return body;
+}
 
-    CurlSlist headers;
-    /* The webPlayback endpoint requires the media dev token in the
-       Authorization header plus the account's music user token. Omitting
-       Authorization makes Apple reject the request with
-       {"failureType":"2002","customerMessage":"Your session has ended..."}. */
-    headers.append(strfmt("Authorization: Bearer %s", devToken.c_str()).c_str());
-    headers.append(strfmt("X-Apple-Music-User-Token: %s", musicToken.c_str()).c_str());
-    headers.append("Content-Type: application/json");
-    headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
-    curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
+std::string AppleApi::webPlaybackProblem(const std::string& rawJson) {
+    cJSON* root = cJSON_Parse(rawJson.c_str());
+    if (!root) return "response is not valid JSON";
 
-    if (!curl.perform()) { LOG_WARN("webplayback curl perform failed"); return ""; }
-    long wstatus = curl.getResponseCode();
-    if (wstatus != 200 && wstatus != 0) {
-        LOG_WARN("webplayback http status=%ld body=%.300s", wstatus, resp.c_str());
-        return "";
-    }
-
-    cJSON* root = cJSON_Parse(resp.c_str());
-    if (!root) { LOG_WARN("webplayback bad json: %.200s", resp.c_str()); return ""; }
-    std::string m3u8;
-
+    std::string problem;
     cJSON* failureType = cJSON_GetObjectItemCaseSensitive(root, "failureType");
-    if (cJSON_IsString(failureType)) {
-        LOG_WARN("webplayback rejected failureType=%s body=%.200s",
-                 failureType->valuestring, resp.c_str());
-        cJSON_Delete(root);
-        return "";
-    }
-
+    cJSON* dialog = cJSON_GetObjectItemCaseSensitive(root, "dialog");
     cJSON* errors = cJSON_GetObjectItemCaseSensitive(root, "errors");
-    if (errors && cJSON_GetArraySize(errors) > 0) {
-        cJSON_Delete(root);
-        LOG_WARN("webplayback API errors: %.200s", resp.c_str());
-        return "";
+    cJSON* songList = cJSON_GetObjectItemCaseSensitive(root, "songList");
+    if (cJSON_IsString(failureType)) {
+        problem = std::string("rejected, failureType=") + failureType->valuestring;
+    } else if (dialog) {
+        /* gamdl treats the mere presence of "dialog" as a failure */
+        problem = "rejected, Apple returned a dialog";
+    } else if (errors && cJSON_GetArraySize(errors) > 0) {
+        problem = "API errors";
+    } else if (!cJSON_IsArray(songList) || cJSON_GetArraySize(songList) == 0) {
+        problem = "no songList in the response";
     }
+    cJSON_Delete(root);
+    return problem;
+}
+
+std::string AppleApi::webPlaybackM3u8(const std::string& rawJson) {
+    cJSON* root = cJSON_Parse(rawJson.c_str());
+    if (!root) return "";
+    std::string m3u8;
 
     cJSON* songList = cJSON_GetObjectItemCaseSensitive(root, "songList");
     if (cJSON_IsArray(songList) && cJSON_GetArraySize(songList) > 0) {
@@ -446,35 +428,15 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     return m3u8;
 }
 
-/* ---- WebPlayback (full JSON) ---- */
-/*
- * Like getWebPlayback() but returns the raw Apple webPlayback API response body
- * verbatim (i.e. the full JSON: songList, assets, metadata, hls-playlist-url …)
- * instead of extracting only the m3u8 URL.
- *
- * isLibrary=true uses the universalLibraryId key instead of salableAdamId, which
- * is required for tracks from the user's personal library.
- *
- * Error conditions (network failure, Apple rejection, bad JSON) return "".
- */
-std::string AppleApi::getWebPlaybackRaw(const std::string& adamId,
-                                         bool isLibrary,
-                                         const std::string& devToken,
-                                         const std::string& musicToken) {
+std::string AppleApi::fetchWebPlayback(const std::string& adamId,
+                                        const std::string& language,
+                                        bool library,
+                                        const std::string& devToken,
+                                        const std::string& musicToken) {
     CurlEasy curl;
     if (!curl.ok) return "";
 
-    cJSON* req = cJSON_CreateObject();
-    if (isLibrary) {
-        cJSON_AddStringToObject(req, "universalLibraryId", adamId.c_str());
-    } else {
-        cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
-    }
-    char* printed = cJSON_PrintUnformatted(req);
-    cJSON_Delete(req);
-    std::string postBody = printed ? printed : "";
-    if (printed) cJSON_free(printed);
-
+    std::string postBody = webPlaybackRequestBody(adamId, language, library);
     std::string resp;
     curl.setOptStr(CURLOPT_URL, "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback");
     curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
@@ -486,51 +448,35 @@ std::string AppleApi::getWebPlaybackRaw(const std::string& adamId,
     curl.setOptInt(CURLOPT_POST, 1);
 
     CurlSlist headers;
+    /* The webPlayback endpoint requires the media dev token in the
+       Authorization header plus the account's music user token. Omitting
+       Authorization makes Apple reject the request with
+       {"failureType":"2002","customerMessage":"Your session has ended..."}. */
     headers.append(strfmt("Authorization: Bearer %s", devToken.c_str()).c_str());
     headers.append(strfmt("X-Apple-Music-User-Token: %s", musicToken.c_str()).c_str());
     headers.append("Content-Type: application/json");
     headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("webplayback-full curl perform failed"); return ""; }
+    if (!curl.perform()) { LOG_WARN("webplayback curl perform failed"); return ""; }
     long wstatus = curl.getResponseCode();
     if (wstatus != 200 && wstatus != 0) {
-        LOG_WARN("webplayback-full http status=%ld body=%.300s", wstatus, resp.c_str());
+        LOG_WARN("webplayback http status=%ld body=%.300s", wstatus, resp.c_str());
         return "";
     }
 
-    /* Validate: must parse as JSON and must not carry a top-level failureType or
-       errors array.  We return the raw string on success so the caller can embed
-       it directly into the /webplayback-full response without re-serialising. */
-    cJSON* root = cJSON_Parse(resp.c_str());
-    if (!root) { LOG_WARN("webplayback-full bad json: %.200s", resp.c_str()); return ""; }
-
-    cJSON* failureType = cJSON_GetObjectItemCaseSensitive(root, "failureType");
-    if (cJSON_IsString(failureType)) {
-        LOG_WARN("webplayback-full rejected failureType=%s body=%.300s",
-                 failureType->valuestring, resp.c_str());
-        cJSON_Delete(root);
+    std::string problem = webPlaybackProblem(resp);
+    if (!problem.empty()) {
+        LOG_WARN("webplayback %s body=%.200s", problem.c_str(), resp.c_str());
         return "";
     }
-
-    cJSON* errors = cJSON_GetObjectItemCaseSensitive(root, "errors");
-    if (errors && cJSON_GetArraySize(errors) > 0) {
-        LOG_WARN("webplayback-full API errors: %.300s", resp.c_str());
-        cJSON_Delete(root);
-        return "";
-    }
-
-    cJSON* songList = cJSON_GetObjectItemCaseSensitive(root, "songList");
-    if (!cJSON_IsArray(songList) || cJSON_GetArraySize(songList) == 0) {
-        LOG_WARN("webplayback-full empty/missing songList: %.200s", resp.c_str());
-        cJSON_Delete(root);
-        return "";
-    }
-
-    cJSON_Delete(root);
-    LOG_DEBUG("webplayback-full success adamId=%s isLibrary=%d size=%zu",
-              adamId.c_str(), (int)isLibrary, resp.size());
     return resp;
+}
+
+std::string AppleApi::getWebPlayback(const std::string& adamId,
+                                      const std::string& devToken,
+                                      const std::string& musicToken) {
+    return webPlaybackM3u8(fetchWebPlayback(adamId, "", false, devToken, musicToken));
 }
 
 /* ---- License ---- */

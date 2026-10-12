@@ -49,6 +49,9 @@ static std::string g_base_dir = "data";
 static std::string g_log_level = "info";
 static std::string g_log_file;
 static int g_token_refresh_interval = 1800;
+/* GET /me hands out this account's Apple Music session tokens (the data a
+   cookies.txt would otherwise provide). Off unless --expose-tokens is given. */
+static bool g_expose_tokens = false;
 
 /* ---- Token state and background refresh ---- */
 static std::mutex g_tokens_mutex;
@@ -62,6 +65,7 @@ struct WebTokens {
     std::string dev_token;
     std::string music_token;
     std::string storefront_id;
+    bool web_dev_token = false;   /* dev_token is the WebPlay token, not the Android one */
     bool valid() const { return !dev_token.empty() && !music_token.empty(); }
 };
 
@@ -158,10 +162,6 @@ static std::string resolve_device_info(const std::string& username) {
 /* ============================== */
 
 static void load_token_cache() {
-    /* NOTE: get_music_token() and get_storefront() read local files only –
-     * no network I/O – so calling them under g_tokens_mutex is safe.
-     * Do NOT add any network call (e.g. AppleApi::getDevToken()) here;
-     * see the get_web_tokens() comment for the correct pattern. */
     std::lock_guard<std::mutex> lock(g_tokens_mutex);
     g_tokens.base_dir = g_base_dir;
     g_tokens.load();
@@ -183,93 +183,34 @@ static void save_token_cache() {
  * token the browser sends.  The Android storeservicescore token
  * (iss=UDK28SN10P) is accepted by webPlayback and lyrics but REJECTED by
  * acquireWebPlaybackLicense (Apple returns HTTP 500), so it is only a
- * fallback when the scrape is unavailable.
- *
- * Thread-safety design
- * --------------------
- * g_tokens_mutex protects ALL reads and writes of g_tokens, g_web_dev_token,
- * and g_last_web_dev_attempt.  The previous implementation called
- * AppleApi::getDevToken() – two sequential HTTP requests with 15-second
- * timeouts each – while holding that mutex, which serialised every concurrent
- * handler (/webplayback-full, /license, /key …) for up to 30 seconds.
- *
- * The fix uses a three-step pattern for the network-heavy refresh:
- *
- *   1. Lock → read shared state → decide whether a fetch is needed →
- *      record the attempt timestamp → unlock.
- *   2. Do the HTTP fetch WITHOUT the lock so other handlers can proceed.
- *   3. Lock → re-check (another goroutine may have won the race) →
- *      store result only when it improves on what is already there → unlock.
- *
- * get_music_token() reads a local file and is safe to call under the lock.
- * AppleApi::getDevToken() does network I/O and must NOT be called under it.
- *
- * Concurrent callers that all decide a refresh is needed will each perform
- * the HTTP fetch independently and the last write wins – acceptable because
- * the token is the same value regardless of which caller scraped it.  Using
- * a separate g_dev_token_fetching flag to make exactly one caller fetch at
- * a time would be correct too, but adds complexity without a meaningful
- * benefit: the music.apple.com JS asset is a static file, the extra requests
- * are cheap, and the window of overlap is very narrow (only while the token
- * is absent or 24 h have elapsed). */
+ * fallback when the scrape is unavailable. */
 static WebTokens get_web_tokens() {
-    /* ── Step 1: read shared state under lock ──────────────────────────── */
-    bool need_fetch = false;
-    std::string snapshot_web_dev;
-    std::string snapshot_music;
-    std::string snapshot_sf;
-    std::string snapshot_android_dev;
-    {
-        std::lock_guard<std::mutex> lock(g_tokens_mutex);
+    std::lock_guard<std::mutex> lock(g_tokens_mutex);
+    if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
+    if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
+    g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
+    /* leave storefront empty when not logged in; do not invent "us" */
 
-        /* Lazily populate music_token and storefront from disk/library the
-         * first time (these calls do local file I/O, not network). */
-        if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
-        if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
-        g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
-
-        auto now = std::chrono::steady_clock::now();
-        if (g_web_dev_token.empty()) {
-            /* Retry the web-scrape at most every 60 s until it succeeds. */
-            if (g_last_web_dev_attempt == std::chrono::steady_clock::time_point{} ||
-                now - g_last_web_dev_attempt > std::chrono::seconds(60)) {
-                g_last_web_dev_attempt = now;   /* mark attempt BEFORE unlock */
-                need_fetch = true;
-            }
-        } else if (now - g_last_web_dev_attempt > std::chrono::hours(24)) {
-            /* Refresh the long-lived WebPlay token once a day. */
+    auto now = std::chrono::steady_clock::now();
+    if (g_web_dev_token.empty()) {
+        /* retry the scrape at most every 60 s until it succeeds */
+        if (g_last_web_dev_attempt == std::chrono::steady_clock::time_point{} ||
+            now - g_last_web_dev_attempt > std::chrono::seconds(60)) {
             g_last_web_dev_attempt = now;
-            need_fetch = true;
+            g_web_dev_token = AppleApi::getDevToken();
         }
-
-        /* Snapshot the values we will return (or fall back to). */
-        snapshot_web_dev   = g_web_dev_token;
-        snapshot_music     = g_tokens.music_token;
-        snapshot_sf        = g_tokens.storefront_id;
-        snapshot_android_dev = g_tokens.dev_token;
-    } /* ── lock released ── */
-
-    /* ── Step 2: do network I/O outside the lock ───────────────────────── */
-    if (need_fetch) {
-        std::string fresh = AppleApi::getDevToken();   /* may take up to 30 s */
-        if (!fresh.empty()) {
-            /* ── Step 3: store result under lock, only when it's an improvement */
-            std::lock_guard<std::mutex> lock(g_tokens_mutex);
-            /* Another concurrent caller might have stored a fresh token
-             * already; prefer the most-recently fetched one (last-write-wins
-             * is safe because all concurrent fetches return the same value). */
-            g_web_dev_token = fresh;
-            snapshot_web_dev = fresh;
-        }
-        /* If the fetch failed, snapshot_web_dev already holds whatever was
-         * in g_web_dev_token before (possibly empty), so callers fall back
-         * to the Android storeservicescore token automatically. */
+    } else if (now - g_last_web_dev_attempt > std::chrono::hours(24)) {
+        /* refresh the long-lived WebPlay token once a day (wrapper-manager) */
+        g_last_web_dev_attempt = now;
+        std::string fresh = AppleApi::getDevToken();
+        if (!fresh.empty()) g_web_dev_token = fresh;
     }
 
     WebTokens tokens;
-    tokens.dev_token    = snapshot_web_dev.empty() ? snapshot_android_dev : snapshot_web_dev;
-    tokens.music_token  = snapshot_music;
-    tokens.storefront_id = snapshot_sf;
+    tokens.dev_token = g_web_dev_token.empty() ? g_tokens.dev_token : g_web_dev_token;
+    tokens.web_dev_token = !g_web_dev_token.empty();
+    tokens.music_token = g_tokens.music_token;
+    tokens.storefront_id = g_tokens.storefront_id;
     return tokens;
 }
 
@@ -406,12 +347,27 @@ static void handle_lyrics(const httplib::Request& req, httplib::Response& res) {
     res.set_content(json_success(data), "application/json");
 }
 
+/* "1", "true", "yes" or "on" (any case) */
+static bool parse_flag(const std::string& v) {
+    std::string t = v;
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return t == "1" || t == "true" || t == "yes" || t == "on";
+}
+
+/* GET /webplayback?adamId=<id>[&full=1][&language=en-US][&library=1]
+   Default: {adamId, m3u8}. With full=1 the response also carries the complete
+   webPlayback JSON under "webplayback" (same shape gamdl gets from Apple), whose
+   songList[0].assets[0].metadata is what song tags are built from. That lets a
+   client without cookies read it through this service's own session. */
 static void handle_webplayback(const httplib::Request& req, httplib::Response& res) {
     auto adamId = req.get_param_value("adamId");
     if (adamId.empty()) {
         res.set_content(json_error(400, "missing adamId"), "application/json");
         return;
     }
+    const bool full = parse_flag(req.get_param_value("full"));
+    const bool library = parse_flag(req.get_param_value("library"));
+    const std::string language = req.get_param_value("language");
 
     WebTokens tokens = get_web_tokens();
     if (!tokens.valid()) {
@@ -419,42 +375,41 @@ static void handle_webplayback(const httplib::Request& req, httplib::Response& r
         return;
     }
 
-    std::string m3u8 = AppleApi::getWebPlayback(adamId, tokens.dev_token, tokens.music_token);
-    if (m3u8.empty()) {
+    std::string raw = AppleApi::fetchWebPlayback(adamId, language, library,
+                                                 tokens.dev_token, tokens.music_token);
+    std::string m3u8 = raw.empty() ? std::string() : AppleApi::webPlaybackM3u8(raw);
+    if (raw.empty() || (!full && m3u8.empty())) {
         res.set_content(json_error(404, "webplayback not available"), "application/json");
         return;
     }
 
     cJSON* data = cJSON_CreateObject();
     cJSON_AddStringToObject(data, "adamId", adamId.c_str());
-    cJSON_AddStringToObject(data, "m3u8", m3u8.c_str());
+    if (!full || !m3u8.empty()) cJSON_AddStringToObject(data, "m3u8", m3u8.c_str());
+    if (full) {
+        cJSON* playback = cJSON_Parse(raw.c_str());
+        if (!playback) {
+            cJSON_Delete(data);
+            res.set_content(json_error(500, "webplayback response could not be parsed"), "application/json");
+            return;
+        }
+        cJSON_AddItemToObject(data, "webplayback", playback);
+    }
     res.set_content(json_success(data), "application/json");
 }
 
-/*
- * GET /webplayback-full?adamId=<id>[&library=1]
- *
- * Returns the full Apple webPlayback JSON (songList, assets, metadata, …) so
- * Python callers can build metadata tags without a separate cookies.txt /
- * media-user-token.  The response embeds the raw Apple JSON inside the standard
- * wrapper-lite envelope:
- *
- *   { "code": 0, "msg": "SUCCESS",
- *     "data": { "adamId": "…", "isLibrary": false,
- *               "webplayback": { "songList": [ { "assets": [ { "metadata": {…} } ] } ] } } }
- *
- * On error the standard { "code": <non-zero>, "msg": "…" } envelope is returned.
- */
-static void handle_webplayback_full(const httplib::Request& req, httplib::Response& res) {
-    auto adamId   = req.get_param_value("adamId");
-    auto libParam = req.get_param_value("library");
-
-    if (adamId.empty()) {
-        res.set_content(json_error(400, "missing adamId"), "application/json");
+/* GET /me - the account data a cookies file would provide: the dev token, the
+   music user token (cookie "media-user-token") and the storefront. Disabled
+   unless the service was started with --expose-tokens, because anybody who can
+   reach this port and reads it can act as this Apple Music account. */
+static void handle_me(const httplib::Request&, httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store");
+    if (!g_expose_tokens) {
+        res.status = 403;
+        res.set_content(json_error(403, "token endpoint disabled; start wrapper-lite with --expose-tokens"),
+                        "application/json");
         return;
     }
-
-    bool isLibrary = (!libParam.empty() && libParam != "0" && libParam != "false");
 
     WebTokens tokens = get_web_tokens();
     if (!tokens.valid()) {
@@ -462,26 +417,21 @@ static void handle_webplayback_full(const httplib::Request& req, httplib::Respon
         return;
     }
 
-    std::string rawJson = AppleApi::getWebPlaybackRaw(adamId, isLibrary,
-                                                       tokens.dev_token, tokens.music_token);
-    if (rawJson.empty()) {
-        res.set_content(json_error(404, "webplayback not available"), "application/json");
-        return;
-    }
+    cJSON* auth = cJSON_CreateObject();
+    cJSON_AddStringToObject(auth, "state", "logged_in");
+    cJSON_AddStringToObject(auth, "dev_token", tokens.dev_token.c_str());
+    cJSON_AddStringToObject(auth, "dev_token_source", tokens.web_dev_token ? "web" : "android");
+    cJSON_AddStringToObject(auth, "music_user_token", tokens.music_token.c_str());
 
-    /* Embed the raw Apple JSON as the "webplayback" field value.
-       We build the outer envelope manually to avoid a double parse+serialise
-       round-trip that could alter Unicode escapes or number precision. */
-    cJSON* webpbJson = cJSON_Parse(rawJson.c_str());
-    if (!webpbJson) {
-        res.set_content(json_error(500, "internal json parse error"), "application/json");
-        return;
+    cJSON* regions = cJSON_CreateArray();
+    if (!tokens.storefront_id.empty()) {
+        cJSON_AddItemToArray(regions, cJSON_CreateString(tokens.storefront_id.c_str()));
     }
 
     cJSON* data = cJSON_CreateObject();
-    cJSON_AddStringToObject(data, "adamId", adamId.c_str());
-    cJSON_AddBoolToObject(data, "isLibrary", isLibrary ? 1 : 0);
-    cJSON_AddItemToObject(data, "webplayback", webpbJson);
+    cJSON_AddItemToObject(data, "auth", auth);
+    cJSON_AddStringToObject(data, "storefront", tokens.storefront_id.c_str());
+    cJSON_AddItemToObject(data, "regions", regions);
     res.set_content(json_success(data), "application/json");
 }
 
@@ -585,6 +535,7 @@ static void print_usage() {
     LOG_INFO("            [--device-info STR] [--base-dir data] [--proxy URL] [--debug]");
     LOG_INFO("            [--log-level debug|info|warn|error] [--log-file PATH]");
     LOG_INFO("            [--token-refresh-interval SECONDS]");
+    LOG_INFO("            [--expose-tokens]   serve this account's tokens on GET /me (see README)");
 }
 
 static LogLevel parse_log_level(const std::string& s) {
@@ -624,6 +575,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--port" && i + 1 < cmdline_args.size()) g_port = atoi(cmdline_args[++i].c_str());
         else if (arg == "--debug") { g_log_level = "debug"; g_ssl_verify_disabled = true; }
         else if (arg == "--code-from-file") g_code_from_file = true;
+        else if (arg == "--expose-tokens") g_expose_tokens = true;
         else if (arg == "--log-level" && i + 1 < cmdline_args.size()) g_log_level = cmdline_args[++i];
         else if (arg == "--log-file" && i + 1 < cmdline_args.size()) g_log_file = cmdline_args[++i];
         else if (arg == "--token-refresh-interval" && i + 1 < cmdline_args.size()) g_token_refresh_interval = atoi(cmdline_args[++i].c_str());
@@ -757,39 +709,8 @@ int main(int argc, char* argv[]) {
     svr.Get("/key", handle_key);
     svr.Get("/lyrics", handle_lyrics);
     svr.Get("/webplayback", handle_webplayback);
-    svr.Get("/webplayback-full", handle_webplayback_full);
+    svr.Get("/me", handle_me);
     svr.Post("/license", handle_license);
-
-    /*
-     * GET /auth
-     *
-     * Returns the current dev_token and music_token (music-user-token) held by
-     * wrapper-lite.  Python callers use these to build an AppleMusicApi client
-     * that can call the Apple AMP Catalog API (get_song?include=lyrics, etc.)
-     * without a separate cookies.txt / media-user-token from the user.
-     *
-     * The tokens are the same ones wrapper-lite already uses internally for
-     * every other Apple API call, so exposing them adds no new attack surface.
-     * The endpoint is intentionally read-only and returns no passwords.
-     *
-     * Response shape:
-     *   { "code": 0, "msg": "SUCCESS",
-     *     "data": { "dev_token": "eyJ…", "music_token": "Au…" } }
-     */
-    svr.Get("/auth", [](const httplib::Request&, httplib::Response& res) {
-        WebTokens tokens = get_web_tokens();
-        if (!tokens.valid()) {
-            res.set_content(
-                json_error(503, "tokens not ready (login required)"),
-                "application/json"
-            );
-            return;
-        }
-        cJSON* data = cJSON_CreateObject();
-        cJSON_AddStringToObject(data, "dev_token",   tokens.dev_token.c_str());
-        cJSON_AddStringToObject(data, "music_token", tokens.music_token.c_str());
-        res.set_content(json_success(data), "application/json");
-    });
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         std::string storefront;
@@ -806,6 +727,12 @@ int main(int argc, char* argv[]) {
             cJSON_AddItemToArray(regions, cJSON_CreateString(storefront.c_str()));
         }
         cJSON_AddItemToObject(data, "regions", regions);
+        /* What this build can do beyond the original API, so clients can adapt
+           instead of guessing from the version. */
+        cJSON* capabilities = cJSON_CreateArray();
+        cJSON_AddItemToArray(capabilities, cJSON_CreateString("webplayback-full"));
+        if (g_expose_tokens) cJSON_AddItemToArray(capabilities, cJSON_CreateString("tokens"));
+        cJSON_AddItemToObject(data, "capabilities", capabilities);
         res.set_content(json_success(data), "application/json");
     });
 
@@ -829,6 +756,11 @@ int main(int argc, char* argv[]) {
     std::thread sig_thread(signal_worker);
     g_svr = &svr;
 
+    if (g_expose_tokens) {
+        LOG_WARN("GET /me is enabled: anyone who can reach %s:%d can read this account's Apple Music "
+                 "session tokens. Keep the port private (loopback, or a firewalled/forwarded port).",
+                 g_host.c_str(), g_port);
+    }
     LOG_INFO("wrapper-lite listening on %s:%d", g_host.c_str(), g_port);
     svr.listen(g_host.c_str(), g_port);
 
