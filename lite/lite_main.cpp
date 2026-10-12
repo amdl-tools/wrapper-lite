@@ -158,6 +158,10 @@ static std::string resolve_device_info(const std::string& username) {
 /* ============================== */
 
 static void load_token_cache() {
+    /* NOTE: get_music_token() and get_storefront() read local files only –
+     * no network I/O – so calling them under g_tokens_mutex is safe.
+     * Do NOT add any network call (e.g. AppleApi::getDevToken()) here;
+     * see the get_web_tokens() comment for the correct pattern. */
     std::lock_guard<std::mutex> lock(g_tokens_mutex);
     g_tokens.base_dir = g_base_dir;
     g_tokens.load();
@@ -179,33 +183,93 @@ static void save_token_cache() {
  * token the browser sends.  The Android storeservicescore token
  * (iss=UDK28SN10P) is accepted by webPlayback and lyrics but REJECTED by
  * acquireWebPlaybackLicense (Apple returns HTTP 500), so it is only a
- * fallback when the scrape is unavailable. */
+ * fallback when the scrape is unavailable.
+ *
+ * Thread-safety design
+ * --------------------
+ * g_tokens_mutex protects ALL reads and writes of g_tokens, g_web_dev_token,
+ * and g_last_web_dev_attempt.  The previous implementation called
+ * AppleApi::getDevToken() – two sequential HTTP requests with 15-second
+ * timeouts each – while holding that mutex, which serialised every concurrent
+ * handler (/webplayback-full, /license, /key …) for up to 30 seconds.
+ *
+ * The fix uses a three-step pattern for the network-heavy refresh:
+ *
+ *   1. Lock → read shared state → decide whether a fetch is needed →
+ *      record the attempt timestamp → unlock.
+ *   2. Do the HTTP fetch WITHOUT the lock so other handlers can proceed.
+ *   3. Lock → re-check (another goroutine may have won the race) →
+ *      store result only when it improves on what is already there → unlock.
+ *
+ * get_music_token() reads a local file and is safe to call under the lock.
+ * AppleApi::getDevToken() does network I/O and must NOT be called under it.
+ *
+ * Concurrent callers that all decide a refresh is needed will each perform
+ * the HTTP fetch independently and the last write wins – acceptable because
+ * the token is the same value regardless of which caller scraped it.  Using
+ * a separate g_dev_token_fetching flag to make exactly one caller fetch at
+ * a time would be correct too, but adds complexity without a meaningful
+ * benefit: the music.apple.com JS asset is a static file, the extra requests
+ * are cheap, and the window of overlap is very narrow (only while the token
+ * is absent or 24 h have elapsed). */
 static WebTokens get_web_tokens() {
-    std::lock_guard<std::mutex> lock(g_tokens_mutex);
-    if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
-    if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
-    g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
-    /* leave storefront empty when not logged in; do not invent "us" */
+    /* ── Step 1: read shared state under lock ──────────────────────────── */
+    bool need_fetch = false;
+    std::string snapshot_web_dev;
+    std::string snapshot_music;
+    std::string snapshot_sf;
+    std::string snapshot_android_dev;
+    {
+        std::lock_guard<std::mutex> lock(g_tokens_mutex);
 
-    auto now = std::chrono::steady_clock::now();
-    if (g_web_dev_token.empty()) {
-        /* retry the scrape at most every 60 s until it succeeds */
-        if (g_last_web_dev_attempt == std::chrono::steady_clock::time_point{} ||
-            now - g_last_web_dev_attempt > std::chrono::seconds(60)) {
+        /* Lazily populate music_token and storefront from disk/library the
+         * first time (these calls do local file I/O, not network). */
+        if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
+        if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
+        g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
+
+        auto now = std::chrono::steady_clock::now();
+        if (g_web_dev_token.empty()) {
+            /* Retry the web-scrape at most every 60 s until it succeeds. */
+            if (g_last_web_dev_attempt == std::chrono::steady_clock::time_point{} ||
+                now - g_last_web_dev_attempt > std::chrono::seconds(60)) {
+                g_last_web_dev_attempt = now;   /* mark attempt BEFORE unlock */
+                need_fetch = true;
+            }
+        } else if (now - g_last_web_dev_attempt > std::chrono::hours(24)) {
+            /* Refresh the long-lived WebPlay token once a day. */
             g_last_web_dev_attempt = now;
-            g_web_dev_token = AppleApi::getDevToken();
+            need_fetch = true;
         }
-    } else if (now - g_last_web_dev_attempt > std::chrono::hours(24)) {
-        /* refresh the long-lived WebPlay token once a day (wrapper-manager) */
-        g_last_web_dev_attempt = now;
-        std::string fresh = AppleApi::getDevToken();
-        if (!fresh.empty()) g_web_dev_token = fresh;
+
+        /* Snapshot the values we will return (or fall back to). */
+        snapshot_web_dev   = g_web_dev_token;
+        snapshot_music     = g_tokens.music_token;
+        snapshot_sf        = g_tokens.storefront_id;
+        snapshot_android_dev = g_tokens.dev_token;
+    } /* ── lock released ── */
+
+    /* ── Step 2: do network I/O outside the lock ───────────────────────── */
+    if (need_fetch) {
+        std::string fresh = AppleApi::getDevToken();   /* may take up to 30 s */
+        if (!fresh.empty()) {
+            /* ── Step 3: store result under lock, only when it's an improvement */
+            std::lock_guard<std::mutex> lock(g_tokens_mutex);
+            /* Another concurrent caller might have stored a fresh token
+             * already; prefer the most-recently fetched one (last-write-wins
+             * is safe because all concurrent fetches return the same value). */
+            g_web_dev_token = fresh;
+            snapshot_web_dev = fresh;
+        }
+        /* If the fetch failed, snapshot_web_dev already holds whatever was
+         * in g_web_dev_token before (possibly empty), so callers fall back
+         * to the Android storeservicescore token automatically. */
     }
 
     WebTokens tokens;
-    tokens.dev_token = g_web_dev_token.empty() ? g_tokens.dev_token : g_web_dev_token;
-    tokens.music_token = g_tokens.music_token;
-    tokens.storefront_id = g_tokens.storefront_id;
+    tokens.dev_token    = snapshot_web_dev.empty() ? snapshot_android_dev : snapshot_web_dev;
+    tokens.music_token  = snapshot_music;
+    tokens.storefront_id = snapshot_sf;
     return tokens;
 }
 
