@@ -109,9 +109,86 @@ All responses use:
 | `/m3u8` | GET | `adamId` |
 | `/key` | GET | `adamId`, `uri` (required; the prefetch `skd://itunes.apple.com/P000000000/s1/e1` is rejected unless `adamId=0`) |
 | `/lyrics` | GET | `adamId`, optional `language`, optional `syllable` (`1`=word-timed syllable-lyrics with translations/romanization, `0`=line-timed lyrics converted in-wrapper **and still carrying translations/romanization as whole-line text**), optional `script` (transliteration script, default `en-Latn`) |
-| `/webplayback` | GET | `adamId` |
+| `/webplayback` | GET | `adamId`, optional `full` (`1`: also return Apple's complete webPlayback JSON), optional `language` (e.g. `en-US`), optional `library` (`1`: `adamId` is a library id). See [Webplayback and account tokens](#webplayback-and-account-tokens) |
+| `/me` | GET | no parameters. This account's session tokens; **disabled unless `--expose-tokens`**. See [Webplayback and account tokens](#webplayback-and-account-tokens) |
 | `/license` | POST | JSON: `adamId`, `challenge`, `uri`, optional `drm-type` (`wv`=Widevine (default), `pr`=PlayReady) |
-| `/status` | GET | returns `regions` (list of storefront codes this wrapper can serve) |
+| `/status` | GET | returns `regions` (list of storefront codes this wrapper can serve) and `capabilities` (`webplayback-full`, plus `tokens` when `--expose-tokens` is on) so clients can adapt |
+
+## Webplayback and account tokens
+
+Song tags (artist, album, genre, composer, copyright, track/disc numbers, ...)
+come from Apple's *webPlayback* response: `songList[0].assets[0].metadata`.
+Asking Apple for it normally needs the account's `media-user-token`, which is why
+downloaders ask for a cookies file. wrapper-lite already holds that token, so it
+can provide the data itself in two ways.
+
+**1. `GET /webplayback?adamId=<id>&full=1`: no tokens leave the service.**
+The default response is unchanged (`{"adamId", "m3u8"}`). With `full=1` it also
+contains Apple's complete JSON under `webplayback`, exactly what a client with a
+cookies file would have received:
+
+```json
+{"code":0,"msg":"SUCCESS","data":{
+  "adamId":"1869136178",
+  "m3u8":"https://aod.itunes.apple.com/.../prog.m3u8",
+  "webplayback":{"songList":[{"songId":"1869136178","assets":[{"flavor":"28:ctrp256",
+                  "metadata":{"itemId":"1869136178","artistName":"...","sort-artist":"...", "...":"..."}}]}]}}}
+```
+
+`language` (e.g. `en-US`) and `library=1` (for tracks of the user's own library)
+are sent to Apple the way gamdl sends them. With `full=1` the call succeeds even
+when the response has no HLS url, because the metadata alone is enough for tags.
+Apple-side failures (`failureType`, a `dialog`, no `songList`) answer
+`404 webplayback not available`.
+
+**2. `GET /me` (opt-in): the data a cookies file would hold.**
+
+```json
+{"code":0,"msg":"SUCCESS","data":{
+  "auth":{"state":"logged_in","dev_token":"...","dev_token_source":"web",
+          "music_user_token":"..."},
+  "storefront":"us","regions":["us"]}}
+```
+
+`dev_token` is the Bearer token for Apple Music's web API (the one the browser
+uses, scraped from music.apple.com), `music_user_token` is the value of the
+`media-user-token` cookie. `dev_token_source` is `android` when the web token
+could not be fetched and the Android token is used as a fallback (accepted for
+webPlayback and lyrics, rejected for licenses). Together they let a client call
+Apple Music's API as this account without a cookies file.
+
+> **Security.** Anyone who can read `/me` can act as this Apple Music account
+> (library, playlists, ...). That is why it answers `403` unless the service was
+> started with `--expose-tokens`, and why the flag prints a warning at start-up.
+> The endpoint cannot restrict itself to local clients: behind the QEMU launcher
+> every connection reaches the guest from the NAT gateway, not from loopback. So
+> the port itself must stay private. Check your setup before enabling the flag:
+>
+> - **Native:** do not combine it with `--host 0.0.0.0` (used in the example
+>   above); the default `127.0.0.1` is fine.
+> - **QEMU:** the launcher's `--host` / `LITE_QEMU_HOST` defaults to `127.0.0.1`;
+>   keep it.
+> - **Docker:** the `docker run -p 12340:12340` example and the shipped
+>   `compose.yaml` publish the port on **all** host interfaces. Change it to
+>   `127.0.0.1:12340:12340` first.
+>
+> Prefer option 1 whenever the client only needs tags. The response is sent with
+> `Cache-Control: no-store` and tokens are never written to the service log.
+
+`--expose-tokens` is forwarded like any other `lite` argument by the QEMU and
+native launchers (`./wrapper-lite-qemu --expose-tokens`); with Docker pass it as
+the container command (`command: ["--expose-tokens"]` in compose).
+
+**Lyrics for downloaders.** gamdl-style tools read lyrics from the song's
+metadata, which Apple only fills in for an authenticated request, so a client
+without cookies gets none. `GET /lyrics?adamId=<id>&syllable=0` supplies them
+with this service's own session. Use `syllable=0` for such tools: it returns
+line-timed TTML in which every `<p begin end>` holds the whole line as direct
+text (word `<span>`s stripped, background vocals merged), which is what their
+parsers read; translations and romanization stay in `<text>` elements outside the
+`<p>` lines, so they never leak into the lyrics. The default `syllable=1`
+(word-timed) is for karaoke-style clients: a parser that reads `<p>` text sees
+nothing in it. A track without lyrics answers `404 lyrics not found`.
 
 ## lite arguments
 
@@ -128,6 +205,7 @@ All responses use:
 | `--log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `--log-file` | — | log file path |
 | `--token-refresh-interval` | `1800` | background refresh interval in seconds |
+| `--expose-tokens` | off | enable `GET /me`, which serves this account's tokens (see the security note below) |
 
 ## Device info
 
